@@ -263,7 +263,328 @@ app.get("/customers/:id/orders", async (req, res) => {
   }
 });
 
-// 4. GET /stats - Get overall statistics
+// 4. GET /orders - List all orders with pagination and filters
+app.get("/orders", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const status = req.query.status; // Optional status filter
+    const user_id = req.query.user_id; // Optional user filter
+
+    // Build WHERE clause dynamically
+    let whereClause = "";
+    let queryParams = [limit, offset];
+    let paramCount = 2;
+
+    if (status) {
+      whereClause += ` WHERE o.status = ${++paramCount}`;
+      queryParams.push(status);
+    }
+
+    if (user_id) {
+      if (!isValidId(user_id)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid user ID",
+          message: "User ID must be a positive integer",
+        });
+      }
+      whereClause +=
+        (status ? " AND" : " WHERE") + ` o.user_id = ${++paramCount}`;
+      queryParams.push(user_id);
+    }
+
+    // Get total count for pagination
+    const countQuery = `SELECT COUNT(*) FROM orders o${whereClause}`;
+    const countParams = queryParams.slice(2); // Remove limit and offset
+    const countResult = await pool.query(countQuery, countParams);
+    const totalOrders = parseInt(countResult.rows[0].count);
+    const totalPages = Math.ceil(totalOrders / limit);
+
+    // Get orders with customer details
+    const query = `
+      SELECT 
+        o.order_id,
+        o.user_id,
+        o.status,
+        o.gender,
+        o.num_of_item,
+        o.created_at,
+        o.shipped_at,
+        o.delivered_at,
+        o.returned_at,
+        u.first_name,
+        u.last_name,
+        u.email
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.id
+      ${whereClause}
+      ORDER BY o.created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+
+    const result = await pool.query(query, queryParams);
+
+    res.json({
+      success: true,
+      data: {
+        orders: result.rows.map((order) => ({
+          order_id: order.order_id,
+          user_id: order.user_id,
+          customer: {
+            first_name: order.first_name,
+            last_name: order.last_name,
+            full_name:
+              order.first_name && order.last_name
+                ? `${order.first_name} ${order.last_name}`
+                : null,
+            email: order.email,
+          },
+          status: order.status,
+          gender: order.gender,
+          num_of_item: order.num_of_item,
+          created_at: order.created_at,
+          shipped_at: order.shipped_at,
+          delivered_at: order.delivered_at,
+          returned_at: order.returned_at,
+        })),
+        pagination: {
+          current_page: page,
+          total_pages: totalPages,
+          total_orders: totalOrders,
+          per_page: limit,
+          has_next_page: page < totalPages,
+          has_prev_page: page > 1,
+        },
+        filters: {
+          status: status || null,
+          user_id: user_id ? parseInt(user_id) : null,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching orders:", error);
+    res.status(500).json({
+      success: false,
+      error: "Internal server error",
+      message: "Failed to fetch orders",
+    });
+  }
+});
+
+// 5. GET /orders/:order_id - Get specific order details
+app.get("/orders/:order_id", async (req, res) => {
+  try {
+    const orderId = req.params.order_id;
+
+    // Validate order ID
+    if (!isValidId(orderId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid order ID",
+        message: "Order ID must be a positive integer",
+      });
+    }
+
+    // Get order details with customer information
+    const query = `
+      SELECT 
+        o.order_id,
+        o.user_id,
+        o.status,
+        o.gender,
+        o.num_of_item,
+        o.created_at,
+        o.shipped_at,
+        o.delivered_at,
+        o.returned_at,
+        u.first_name,
+        u.last_name,
+        u.email,
+        u.age,
+        u.state,
+        u.city,
+        u.country,
+        u.traffic_source
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.id
+      WHERE o.order_id = $1
+    `;
+
+    const result = await pool.query(query, [orderId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Order not found",
+        message: `Order with ID ${orderId} does not exist`,
+      });
+    }
+
+    const order = result.rows[0];
+
+    // Calculate order timeline and duration
+    const timeline = {
+      ordered: order.created_at,
+      shipped: order.shipped_at,
+      delivered: order.delivered_at,
+      returned: order.returned_at,
+    };
+
+    let processingTime = null;
+    let deliveryTime = null;
+
+    if (order.shipped_at && order.created_at) {
+      processingTime = Math.round(
+        (new Date(order.shipped_at) - new Date(order.created_at)) /
+          (1000 * 60 * 60 * 24)
+      );
+    }
+
+    if (order.delivered_at && order.shipped_at) {
+      deliveryTime = Math.round(
+        (new Date(order.delivered_at) - new Date(order.shipped_at)) /
+          (1000 * 60 * 60 * 24)
+      );
+    }
+
+    const formattedOrder = {
+      order_id: order.order_id,
+      status: order.status,
+      num_of_item: order.num_of_item,
+      gender: order.gender,
+      customer: {
+        user_id: order.user_id,
+        first_name: order.first_name,
+        last_name: order.last_name,
+        full_name:
+          order.first_name && order.last_name
+            ? `${order.first_name} ${order.last_name}`
+            : null,
+        email: order.email,
+        age: order.age,
+        location: `${order.city}, ${order.state}, ${order.country}`,
+        traffic_source: order.traffic_source,
+      },
+      timeline: timeline,
+      processing_metrics: {
+        processing_time_days: processingTime,
+        delivery_time_days: deliveryTime,
+        total_fulfillment_days:
+          processingTime && deliveryTime ? processingTime + deliveryTime : null,
+      },
+    };
+
+    res.json({
+      success: true,
+      data: {
+        order: formattedOrder,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching order details:", error);
+    res.status(500).json({
+      success: false,
+      error: "Internal server error",
+      message: "Failed to fetch order details",
+    });
+  }
+});
+
+// 6. GET /orders/status/:status - Get orders by status
+app.get("/orders/status/:status", async (req, res) => {
+  try {
+    const status = req.params.status.toLowerCase();
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+
+    // Validate status
+    const validStatuses = [
+      "pending",
+      "shipped",
+      "delivered",
+      "returned",
+      "cancelled",
+    ];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid status",
+        message: `Status must be one of: ${validStatuses.join(", ")}`,
+      });
+    }
+
+    // Get total count for pagination
+    const countQuery = "SELECT COUNT(*) FROM orders WHERE LOWER(status) = $1";
+    const countResult = await pool.query(countQuery, [status]);
+    const totalOrders = parseInt(countResult.rows[0].count);
+    const totalPages = Math.ceil(totalOrders / limit);
+
+    // Get orders with customer details
+    const query = `
+      SELECT 
+        o.order_id,
+        o.user_id,
+        o.status,
+        o.num_of_item,
+        o.created_at,
+        o.shipped_at,
+        o.delivered_at,
+        o.returned_at,
+        u.first_name,
+        u.last_name,
+        u.email
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.id
+      WHERE LOWER(o.status) = $1
+      ORDER BY o.created_at DESC
+      LIMIT $2 OFFSET $3
+    `;
+
+    const result = await pool.query(query, [status, limit, offset]);
+
+    res.json({
+      success: true,
+      data: {
+        status_filter: status,
+        orders: result.rows.map((order) => ({
+          order_id: order.order_id,
+          user_id: order.user_id,
+          customer_name:
+            order.first_name && order.last_name
+              ? `${order.first_name} ${order.last_name}`
+              : null,
+          customer_email: order.email,
+          status: order.status,
+          num_of_item: order.num_of_item,
+          created_at: order.created_at,
+          shipped_at: order.shipped_at,
+          delivered_at: order.delivered_at,
+          returned_at: order.returned_at,
+        })),
+        pagination: {
+          current_page: page,
+          total_pages: totalPages,
+          total_orders: totalOrders,
+          per_page: limit,
+          has_next_page: page < totalPages,
+          has_prev_page: page > 1,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching orders by status:", error);
+    res.status(500).json({
+      success: false,
+      error: "Internal server error",
+      message: "Failed to fetch orders by status",
+    });
+  }
+});
+
+// 7. GET /stats - Get overall statistics
 app.get("/stats", async (req, res) => {
   try {
     const statsQuery = `
@@ -364,6 +685,9 @@ app.listen(port, () => {
   console.log(`   GET  /customers - List all customers (with pagination)`);
   console.log(`   GET  /customers/:id - Get customer details`);
   console.log(`   GET  /customers/:id/orders - Get customer orders`);
+  console.log(`   GET  /orders - List all orders (with pagination & filters)`);
+  console.log(`   GET  /orders/:order_id - Get specific order details`);
+  console.log(`   GET  /orders/status/:status - Get orders by status`);
   console.log(`   GET  /stats - Get overall statistics`);
 });
 
